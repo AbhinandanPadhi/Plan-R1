@@ -1,0 +1,7 @@
+processed_data/*
+processed_data_mini/*
+*.pyc
+*/__pycache__/
+datasets/__pycache__/*
+ckpts/fine-tuning.ckpt
+ckpts/pre-training.ckpt

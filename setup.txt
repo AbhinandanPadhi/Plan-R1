@@ -1,0 +1,14 @@
+conda create -n plan-r1 python=3.9
+conda activate plan-r1
+
+conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+conda install pytorch-lightning==2.0.3
+pip install torch-scatter==2.1.2 -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
+pip install torch_geometric==2.3.1
+cd /home/jovyan/work/nuplan/nuplan-devkit
+pip install -e .
+pip install pip==24.0
+pip install -r requirements.txt
+pip install tensorboard
+pip install numpy==1.24.4
+cd /home/jovyan/work/
