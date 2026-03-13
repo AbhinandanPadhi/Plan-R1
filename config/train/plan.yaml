@@ -1,7 +1,6 @@
 univeral_config: &univeral_config
   mode: "plan"
   token_dict_path: tokens/tokens_1024.pt
-  num_tokens: 1024
   interval: 5
   num_historical_steps: 20
   num_future_steps: 80
@@ -9,7 +8,7 @@ univeral_config: &univeral_config
 datamodule:
   <<: *univeral_config
   root: ../nuplan/dataset
-  dir: train
+  dir: mini
   train_batch_size: 4
   val_batch_size: 4
   shuffle: True
@@ -25,7 +24,7 @@ trainer:
   ckpt_path: ckpts/pre-training.ckpt
   strategy: ddp_find_unused_parameters_true
   accelerator: "gpu"
-  devices: 8
+  devices: 1
   max_epochs: 5
   ckpt:
     monitor: val_reward

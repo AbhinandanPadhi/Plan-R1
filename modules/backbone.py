@@ -16,7 +16,7 @@ from utils import move_dict_to_device
 class Backbone(nn.Module):
     def __init__(self,
                  token_dict: Dict,
-                 num_tokens: int,
+                 action_dim: int,
                  interval: int,
                  hidden_dim: int,
                  num_historical_steps: int,
@@ -28,7 +28,7 @@ class Backbone(nn.Module):
                  dropout: float) -> None:
         super(Backbone, self).__init__()
         self.token_dict = token_dict
-        self.num_tokens = num_tokens
+        self.action_dim = action_dim
         self.interval = interval
         self.hidden_dim = hidden_dim
         self.num_historical_steps = num_historical_steps
@@ -47,9 +47,9 @@ class Backbone(nn.Module):
 
         self.agent_emb_layer = TwoLayerMLP(input_dim=4, hidden_dim=hidden_dim, output_dim=hidden_dim)
 
-        self.token_emb_vehicle = nn.Embedding(num_tokens, hidden_dim)
-        self.token_emb_pedestrian = nn.Embedding(num_tokens, hidden_dim)
-        self.token_emb_bicycle = nn.Embedding(num_tokens, hidden_dim)
+        self.token_emb_vehicle = nn.Linear(action_dim, hidden_dim)
+        self.token_emb_pedestrian = nn.Linear(action_dim, hidden_dim)
+        self.token_emb_bicycle = nn.Linear(action_dim, hidden_dim)
 
         self.fusion_layer = TwoLayerMLP(input_dim=hidden_dim * 2, hidden_dim=hidden_dim, output_dim=hidden_dim)
 
@@ -76,10 +76,17 @@ class Backbone(nn.Module):
         vehicle_mask = a_type == 0
         pedestrian_mask = a_type == 1
         bicycle_mask = a_type == 2
+        a_token_ids = data['agent']['recon_token'].long()
+        token_features = torch.zeros(num_agents, num_intervals, self.action_dim, device=device)
+        self.token_dict = move_dict_to_device(self.token_dict, device)
+        token_features[vehicle_mask] = self.token_dict['Vehicle'][a_token_ids[vehicle_mask]]
+        token_features[pedestrian_mask] = self.token_dict['Pedestrian'][a_token_ids[pedestrian_mask]]
+        token_features[bicycle_mask] = self.token_dict['Bicycle'][a_token_ids[bicycle_mask]]
+        
         a_token_embs = torch.zeros(num_agents, num_intervals, self.hidden_dim, device=device)
-        a_token_embs[vehicle_mask] = self.token_emb_vehicle(data['agent']['recon_token'][vehicle_mask])
-        a_token_embs[pedestrian_mask] = self.token_emb_pedestrian(data['agent']['recon_token'][pedestrian_mask])
-        a_token_embs[bicycle_mask] = self.token_emb_bicycle(data['agent']['recon_token'][bicycle_mask])
+        a_token_embs[vehicle_mask] = self.token_emb_vehicle(token_features[vehicle_mask])
+        a_token_embs[pedestrian_mask] = self.token_emb_pedestrian(token_features[pedestrian_mask])
+        a_token_embs[bicycle_mask] = self.token_emb_bicycle(token_features[bicycle_mask])
 
         k_embs = self.fusion_layer(torch.cat([a_embs.unsqueeze(1).expand(-1, num_intervals, -1), a_token_embs], dim=-1)).reshape(-1, self.hidden_dim)   #[(N1,...,Nb)*T,D]
 
@@ -159,6 +166,14 @@ class Backbone(nn.Module):
         vehicle_mask = a_type == 0
         pedestrian_mask = a_type == 1
         bicycle_mask = a_type == 2
+        if data['agent']['infer_token'].dim() == 2:
+            a_token_ids = data['agent']['infer_token'].long()
+            token_features = torch.zeros(num_agents, num_intervals, self.action_dim, device=a_embs.device)
+            token_features[vehicle_mask] = self.token_dict['Vehicle'][a_token_ids[vehicle_mask]]
+            token_features[pedestrian_mask] = self.token_dict['Pedestrian'][a_token_ids[pedestrian_mask]]
+            token_features[bicycle_mask] = self.token_dict['Bicycle'][a_token_ids[bicycle_mask]]
+            data['agent']['infer_token'] = token_features
+
         a_token_embs = torch.zeros(num_agents, num_intervals, self.hidden_dim, device=a_embs.device)
         a_token_embs[vehicle_mask] = self.token_emb_vehicle(data['agent']['infer_token'][vehicle_mask])
         a_token_embs[pedestrian_mask] = self.token_emb_pedestrian(data['agent']['infer_token'][pedestrian_mask])

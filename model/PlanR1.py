@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
+
 from torch_geometric.data import Batch
 from torch_geometric.utils import unbatch
 import math
@@ -18,7 +18,7 @@ class PlanR1(pl.LightningModule):
     def __init__(self,
                  mode: str,
                  token_dict_path: str,
-                 num_tokens: int = 1024,
+                 action_dim: int = 3,
                  interval: int = 5,
                  hidden_dim: int = 128,
                  num_historical_steps: int = 20,
@@ -48,7 +48,7 @@ class PlanR1(pl.LightningModule):
         self.save_hyperparameters()
         self.mode = mode
         self.token_dict = torch.load(token_dict_path)
-        self.num_tokens = num_tokens
+        self.action_dim = action_dim
         self.interval = interval
         self.hidden_dim = hidden_dim
         self.num_historical_steps = num_historical_steps
@@ -84,7 +84,7 @@ class PlanR1(pl.LightningModule):
         # pred model
         self.pred_backbone = Backbone(
             token_dict=self.token_dict,
-            num_tokens=num_tokens,
+            action_dim=action_dim,
             interval=interval,
             hidden_dim=hidden_dim,
             num_historical_steps=num_historical_steps,
@@ -101,12 +101,12 @@ class PlanR1(pl.LightningModule):
             num_heads=num_heads,
             dropout=dropout
         )
-        self.pred_decoder_head = TwoLayerMLP(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=num_tokens)
+        self.pred_decoder_head = TwoLayerMLP(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=action_dim)
 
         # plan model
         self.plan_backbone = Backbone(
             token_dict=self.token_dict,
-            num_tokens=num_tokens,
+            action_dim=action_dim,
             interval=interval,
             hidden_dim=hidden_dim,
             num_historical_steps=num_historical_steps,
@@ -123,10 +123,11 @@ class PlanR1(pl.LightningModule):
             num_heads=num_heads,
             dropout=dropout
         )
-        self.plan_decoder_head = TwoLayerMLP(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=num_tokens)
+        self.plan_decoder_head = TwoLayerMLP(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=action_dim)
 
         # metric
-        self.cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
+        self.reg_loss = nn.MSELoss(reduction='none')
+        self.action_std = 0.1
         self.token_cls_acc = TokenClsAcc()
         self.min_joint_ade = minJointADE()
         self.min_joint_fde = minJointFDE()
@@ -149,12 +150,24 @@ class PlanR1(pl.LightningModule):
             feat = self.pred_backbone(data=data, g_embs=polygon_embs)
             logits = self.pred_decoder_head(feat)
             # compute loss
-            target = data['agent']['recon_token'].roll(-1,1)
+            target_ids = data['agent']['recon_token'].roll(-1,1).long()
             target_mask = data['agent']['recon_token_mask'].roll(-1,1)
             target_mask[:, -1] = False
-            cls_loss = self.cls_loss(logits[target_mask], target[target_mask])
-            self.log('train_cls_loss', cls_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
-            return cls_loss
+            
+            a_type = data['agent']['type'].long().unsqueeze(1).expand(-1, target_ids.size(1))
+            vehicle_mask = a_type == 0
+            pedestrian_mask = a_type == 1
+            bicycle_mask = a_type == 2
+            
+            continuous_target = torch.zeros(*target_ids.shape, self.action_dim, device=target_ids.device)
+            self.token_dict = move_dict_to_device(self.token_dict, target_ids.device)
+            continuous_target[vehicle_mask] = self.token_dict['Vehicle'][target_ids[vehicle_mask]]
+            continuous_target[pedestrian_mask] = self.token_dict['Pedestrian'][target_ids[pedestrian_mask]]
+            continuous_target[bicycle_mask] = self.token_dict['Bicycle'][target_ids[bicycle_mask]]
+            
+            reg_loss = self.reg_loss(logits[target_mask], continuous_target[target_mask]).mean()
+            self.log('train_reg_loss', reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1, sync_dist=True)
+            return reg_loss
         
         elif self.mode == 'plan':
             advantages, pred_logps, plan_logps, rewards, valid_mask = self.rollout(data)
@@ -185,7 +198,7 @@ class PlanR1(pl.LightningModule):
         for _ in range(self.num_future_intervals):
             k_embs_dict, k_embs_step = backbone.inference(data=data, g_embs=polygon_embs, a_embs=agent_embs, k_embs_dict=k_embs_dict)
             logits_step = decoder_head(k_embs_step)
-            action_step = sample_with_top_k_top_p(logits_step.unsqueeze(1), top_k=self.pred_top_k).squeeze(1).squeeze(1)
+            action_step = logits_step.clone()
 
             data = self.transition(data, action_step)
 
@@ -210,8 +223,8 @@ class PlanR1(pl.LightningModule):
 
             pred_logits_step = self.pred_decoder_head(pred_k_embs_step)
             plan_logits_step = self.plan_decoder_head(plan_k_embs_step)
-            action_step = sample_with_top_k_top_p(pred_logits_step.unsqueeze(1), top_k=self.pred_top_k).squeeze(1).squeeze(1)
-            ego_action_step = sample_with_top_k_top_p(plan_logits_step[ego_index].unsqueeze(1), top_k=self.plan_top_k).squeeze(1).squeeze(1)
+            action_step = pred_logits_step.clone()
+            ego_action_step = plan_logits_step[ego_index].clone()
             action_step[ego_index] = ego_action_step
 
             data = self.transition(data, action_step)
@@ -229,12 +242,23 @@ class PlanR1(pl.LightningModule):
             feat = self.pred_backbone(data=data, g_embs=polygon_embs)
             logits = self.pred_decoder_head(feat)
             # compute loss
-            target = data['agent']['recon_token'].roll(-1,1)
+            target_ids = data['agent']['recon_token'].roll(-1,1).long()
             target_mask = data['agent']['recon_token_mask'].roll(-1,1)
             target_mask[:, -1] = 0
-            cls_loss = self.cls_loss(logits[target_mask], target[target_mask])
-            self.log('val_token_cls_acc', self.token_cls_acc(logits[target_mask], target[target_mask]), prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-            self.log('val_cls_loss', cls_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+            
+            a_type = data['agent']['type'].long().unsqueeze(1).expand(-1, target_ids.size(1))
+            vehicle_mask = a_type == 0
+            pedestrian_mask = a_type == 1
+            bicycle_mask = a_type == 2
+            
+            continuous_target = torch.zeros(*target_ids.shape, self.action_dim, device=target_ids.device)
+            self.token_dict = move_dict_to_device(self.token_dict, target_ids.device)
+            continuous_target[vehicle_mask] = self.token_dict['Vehicle'][target_ids[vehicle_mask]]
+            continuous_target[pedestrian_mask] = self.token_dict['Pedestrian'][target_ids[pedestrian_mask]]
+            continuous_target[bicycle_mask] = self.token_dict['Bicycle'][target_ids[bicycle_mask]]
+            
+            reg_loss = self.reg_loss(logits[target_mask], continuous_target[target_mask]).mean()
+            self.log('val_reg_loss', reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
             # inference
             _, position, heading, valid_mask = self.pred_inference(data)
 
@@ -290,11 +314,7 @@ class PlanR1(pl.LightningModule):
         pedestrian_mask = a_type == 1
         bicycle_mask = a_type == 2
 
-        token = torch.zeros(action.size(0), 3, device=action.device)
-        self.token_dict = move_dict_to_device(self.token_dict, action.device)
-        token[vehicle_mask] = self.token_dict['Vehicle'][action[vehicle_mask]]
-        token[pedestrian_mask] = self.token_dict['Pedestrian'][action[pedestrian_mask]]
-        token[bicycle_mask] = self.token_dict['Bicycle'][action[bicycle_mask]]
+        token = action
         token_position = transform_point_to_global_coordinate(token[:, :2], next_data['agent']['infer_position'][:, -1], next_data['agent']['infer_heading'][:, -1])
         token_heading = wrap_angle(token[:, 2] + next_data['agent']['infer_heading'][:, -1])
 
@@ -327,17 +347,21 @@ class PlanR1(pl.LightningModule):
             pred_logits_step = self.pred_decoder_head(pred_k_embs_step)
             plan_logits_step = self.plan_decoder_head(plan_k_embs_step)
 
-            action_step = sample_with_top_k_top_p(pred_logits_step.unsqueeze(1), top_k=1).squeeze(1).squeeze(1)
-            ego_action_step = sample_with_top_k_top_p(plan_logits_step[ego_index].unsqueeze(1), top_k=self.rollout_top_k).squeeze(1).squeeze(1)
+            from torch.distributions import Normal
             
-            pred_dist_step = Categorical(logits=pred_logits_step[ego_index])
-            plan_dist_step = Categorical(logits=plan_logits_step[ego_index])
+            action_step = pred_logits_step.clone()
+            
+            pred_dist_step = Normal(loc=pred_logits_step[ego_index], scale=self.action_std)
+            plan_dist_step = Normal(loc=plan_logits_step[ego_index], scale=self.action_std)
+            
+            ego_action_step = plan_dist_step.sample()
+            
             if step == 0:
-                pred_logps = pred_dist_step.log_prob(ego_action_step).unsqueeze(1)
-                plan_logps = plan_dist_step.log_prob(ego_action_step).unsqueeze(1)
+                pred_logps = pred_dist_step.log_prob(ego_action_step).sum(dim=-1).unsqueeze(1)
+                plan_logps = plan_dist_step.log_prob(ego_action_step).sum(dim=-1).unsqueeze(1)
             else:
-                pred_logps = torch.cat([pred_logps, pred_dist_step.log_prob(ego_action_step).unsqueeze(1)], dim=1)
-                plan_logps = torch.cat([plan_logps, plan_dist_step.log_prob(ego_action_step).unsqueeze(1)], dim=1)
+                pred_logps = torch.cat([pred_logps, pred_dist_step.log_prob(ego_action_step).sum(dim=-1).unsqueeze(1)], dim=1)
+                plan_logps = torch.cat([plan_logps, plan_dist_step.log_prob(ego_action_step).sum(dim=-1).unsqueeze(1)], dim=1)
 
             action_step[ego_index] = ego_action_step
             data = self.transition(data, action_step)

@@ -1,5 +1,4 @@
-processed_data/*
-processed_data_mini/*
+processed_data*/*
 *.pyc
 */__pycache__/
 datasets/__pycache__/*

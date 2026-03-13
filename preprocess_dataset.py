@@ -209,9 +209,33 @@ class NuplanDataset(Dataset):
     # NuplanDataset(root='../nuplan/dataset/', dir='train_boston', split='val', mode='pred', num_total_scenarios=50000)
 
 if __name__ == '__main__':
-    # Changed dir to 'mini' (use the mini split for quick testing) and drastically reduced num_total_scenarios
+    import argparse
+    
+    # Set up arg parsing for parallel jobs
+    parser = argparse.ArgumentParser(description="Process nuPlan dataset splits")
+    parser.add_argument('--split', type=str, required=True, choices=['train', 'val'], help="Dataset split to process")
+    parser.add_argument('--mode', type=str, required=True, choices=['plan', 'pred'], help="Mode to process")
+    
+    # Added args for directory, batch size, and max workers
+    parser.add_argument('--dir', type=str, default='mini', help="Dataset directory/split to process (e.g., 'mini', 'train_boston', 'train_singapore')")
+    parser.add_argument('--batch_size', type=int, default=40, help="Batch size for parallel processing (default: 40)")
+    parser.add_argument('--max_workers', type=int, default=20, help="Maximum number of workers (default: 20)")
+    
+    args = parser.parse_args()
+
     save_root = '/home/jovyan/work/Plan-R1/processed_data'
-    NuplanDataset(root='../nuplan/dataset/', dir='mini', split='train', mode='plan', save_root=save_root, batch_size=40, max_workers=20)
-    NuplanDataset(root='../nuplan/dataset/', dir='mini', split='val', mode='plan', save_root=save_root, batch_size=40, max_workers=20)
-    NuplanDataset(root='../nuplan/dataset/', dir='mini', split='train', mode='pred', save_root=save_root, batch_size=40, max_workers=20)
-    NuplanDataset(root='../nuplan/dataset/', dir='mini', split='val', mode='pred', save_root=save_root, batch_size=40, max_workers=20)
+    
+    print(f"Starting processing for dir: {args.dir}, split: {args.split}, mode: {args.mode}")
+    print(f"Using batch_size: {args.batch_size}, max_workers: {args.max_workers}")
+    
+    NuplanDataset(
+        root='../nuplan/dataset/', 
+        dir=args.dir, 
+        split=args.split, 
+        mode=args.mode, 
+        save_root=save_root, 
+        batch_size=args.batch_size, 
+        max_workers=args.max_workers
+    )
+    
+    print(f"Finished processing for dir: {args.dir}, split: {args.split}, mode: {args.mode}")
